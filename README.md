@@ -1,10 +1,19 @@
-# Federated Learning · 4-Protocol Comparison Platform
+# PILT — Probabilistic Importance-Layered Transport for Federated Learning
 
-Four communication protocols (**DCTCP / LTP / PLOT / PILT**) running
-end-to-end BSP federated learning on the same NS3-AI wireless channel,
-the same dataset and the same model initialisation. Ships with an
-independent C++ protocol library (`cpp_proto/`) and a single-file,
-interactive Plotly dashboard.
+**PILT** is a transport / scheduling co-design for synchronous (BSP)
+federated learning over a shared wireless channel. It treats every BSP
+round as a constrained allocation problem on a 2-D time-frequency
+resource-block (RB) grid and asks:
+
+> *Given a tight per-round byte budget, which layers from which workers
+> should we send, in what order, on which RBs, so that the recovered
+> aggregate is as close to the true average as possible?*
+
+The repository ships the full PILT design (algorithm + transport
+encoder + GA scheduler + C++ library) together with three reference
+baselines (DCTCP / LTP / PLOT) that share the same NS3-AI channel,
+dataset and model — so PILT's design choices can be measured rather
+than asserted.
 
 ```
         ┌─────────────────────────┐
@@ -17,31 +26,73 @@ interactive Plotly dashboard.
 
 ---
 
-## Quick Start
+## PILT design at a glance
+
+PILT has four cooperating components. Each one is replaceable; together
+they define what we call PILT.
+
+| component | symbol | role |
+|---|---|---|
+| **Importance tracker** | `v_l ← β·v_l + (1-β)·‖g_l‖₂/√S_l` | per-layer L2-norm EMA, RMS-normalised across layer sizes |
+| **Ranked ε-allocator** | `ε_l = f(rank_l, E_total, ε_min)` | distributes the round byte budget `E_total` across layers by importance rank, with a floor `ε_min` so unimportant layers still drift |
+| **Top-\|g\| + EF encoder** | `pilt::PILTEncoder` | per-(worker, layer) selects the highest-magnitude entries that fit `ε_l·S_l` bytes, packs `(idx, val, CRC32)` sparse frames, and feeds the discarded mass back as an error-feedback residual the next round |
+| **GA scheduler over RB grid** | `PILTScheduler` (dual-population GA) | jointly chooses the start-slot of every (worker, layer) frame on an `M`-wide RB grid, minimising makespan subject to per-RB exclusivity and PS overhead pipelining |
+
+All four pieces live behind a single API:
+
+```python
+from protocols.pilt_protocol import PILTProtocol, PILTConfig, GAConfig
+proto = PILTProtocol(n_workers=K, n_layers=L, layer_sizes=S,
+                     cfg=PILTConfig(beta=0.9, d=0.05, E_total=0.5,
+                                    eps_min=0.05, ga=GAConfig(...)))
+eps         = proto.compute_ratios()              # ranked ε_l
+budget      = proto.target_payload_bytes(eps)     # per-(k,l) bytes
+start, T    = proto.solve_schedule(D)             # GA → start-slot table
+plan        = proto.schedule_to_worker_plan(start, K)
+enc, masks, sent = proto.worker_encode(k, grads_k, eps)
+proto.update_importance(avg_layers)               # v_l for next round
+```
+
+The C++ side mirrors this:
+
+```cpp
+#include "pilt/encoder.hpp"
+#include "pilt/aggregator.hpp"
+pilt::EncoderConfig cfg{.E_total=0.5f, .eps_min=0.05f, .beta=0.9f, .d=0.05f};
+pilt::PILTEncoder    enc({S0, S1, S2}, cfg);
+pilt::PILTAggregator agg({S0, S1, S2});
+```
+
+See `protocols/pilt_protocol.py` and `cpp_proto/include/pilt/` for the
+full source, and `cpp_proto/README.md` for the C++ API surface.
+
+---
+
+## Quick start
+
+### C++ library + bench + interactive dashboard
 
 ```bash
-# C++ library + bench + single-file dashboard
 cd cpp_proto
 bash run_demo.sh
 # → open http://localhost:8080/viz/dashboard.html in a browser
 ```
 
-`run_demo.sh` runs `cmake build → ctest → ./compare_protocols → pack JSON
-→ start an HTTP server`. If `results/metrics_*.npz` already exists from
-the simulation driver it is folded into the dashboard automatically.
+`run_demo.sh` runs `cmake build → ctest → ./compare_protocols → pack
+JSON → start an HTTP server`. If `results/metrics_*.npz` already exists
+from the simulation driver it is folded into the dashboard
+automatically.
 
----
-
-## Simulation driver (NS3-AI BSP)
+### NS3-AI BSP simulation driver
 
 ```bash
 ./setup_ns3ai.sh                              # build the NS-3 module (once)
 
-# Single protocol
+# Run PILT on its own
 python3 main.py --protocols pilt --workers 10 --model resnet50 \
                 --time_limit 1200 --seed 0
 
-# All four protocols (sequential)
+# Run PILT alongside the three baselines (sequential)
 python3 main.py --protocols dctcp,ltp,plot,pilt --workers 10 \
                 --model resnet50 --time_limit 1200 --seed 0
 ```
@@ -72,10 +123,13 @@ Outputs are saved to `results/metrics_<protocol>.npz`:
 
 ---
 
-## Reference Numbers
+## Validating the design
 
 ResNet-50, K=10, CIFAR-100, time_limit=1200 s, seed=0, identical NS3-AI
-channel for all four protocols:
+channel for all four protocols. The three baselines (DCTCP / LTP /
+PLOT) ablate the PILT design choices: DCTCP keeps the full gradient,
+LTP drops bytes randomly under a deadline, PLOT does per-layer LTT but
+without importance ranking or RB scheduling.
 
 | protocol | rounds | final acc | final loss | mean round_ms | p99 FCT (ms) |
 |---|---:|---:|---:|---:|---:|
@@ -96,7 +150,8 @@ Time-to-target (simulated seconds needed to reach a given accuracy):
 | 0.17  | — |  n/a |  n/a | 823.9 | — |
 
 C++ library head-to-head bench (synthetic gradients, single-machine
-round-trip, K=10, 30 rounds):
+round-trip, K=10, 30 rounds) — confirms PILT's wire footprint advantage
+in isolation:
 
 | protocol | bytes_sent | delivery_correlation | encode_ms |
 |---|---:|---:|---:|
@@ -105,8 +160,8 @@ round-trip, K=10, 30 rounds):
 | PLOT  | 56.5 MB | 1.000 |  9.9 |
 | PILT  | 0.81 MB | 0.859 |  9.0 |
 
-Live data is read by `cpp_proto/viz/dashboard.html` (auto-loads the most
-recent `.npz` outputs and the bench JSON).
+Live data is read by `cpp_proto/viz/dashboard.html` (auto-loads the
+most recent `.npz` outputs and the bench JSON).
 
 ---
 
@@ -121,21 +176,22 @@ FL/
 ├── requirements.txt
 │
 ├── protocols/                # algorithm-side implementations
-│   ├── pilt_protocol.py      #   importance EMA + ranked ε_l + top-|g| + EF + GA
-│   ├── ltp_protocol.py       #   Early-Close + Random-K bubble-fill
-│   └── plot_protocol.py      #   per-layer LTT + retx
-│   # DCTCP is inlined in main.py (reliable full-grad)
+│   ├── pilt_protocol.py      #   PILT: importance EMA + ranked ε_l + top-|g| + EF + GA
+│   ├── ltp_protocol.py       #   baseline: Early-Close + Random-K bubble-fill
+│   └── plot_protocol.py      #   baseline: per-layer LTT + retx
+│   # DCTCP baseline is inlined in main.py (reliable full-grad)
 │
 ├── federated/                # PyTorch FL building blocks
 │   ├── dataset.py            #   CIFAR-100 + Dirichlet non-IID split
 │   └── model_torch.py        #   ResNet/VGG + FLWorker + ParameterServer
 │
 ├── cpp_proto/                # standalone C++ protocol library + bench + dashboard
-│   ├── include/              #   pilt/ dctcp/ ltp/ plot/ common/
-│   ├── src/                  #   PILT implementation (others are header-only)
+│   ├── include/pilt/         #   PILT C++ headers (encoder / aggregator / wire)
+│   ├── include/{dctcp,ltp,plot}/  baselines, header-only
+│   ├── src/                  #   PILT implementation
 │   ├── tests/                #   ctest, 4 test binaries
 │   ├── demo/                 #   PILT TCP end-to-end demo
-│   ├── bench/                #   compare_protocols (4-protocol head-to-head)
+│   ├── bench/                #   compare_protocols (PILT vs 3 baselines)
 │   ├── viz/                  #   dashboard.html + sim_to_json.py
 │   ├── CMakeLists.txt
 │   └── run_demo.sh           #   one-shot build+test+bench+serve
@@ -144,33 +200,8 @@ FL/
 ```
 
 `results/`, `data/`, `logs/` and `cpp_proto/build/` are created on
-demand by the runners and are intentionally not part of the source tree.
-
----
-
-## Protocol entry points
-
-### Python (NS3-AI driver)
-
-```python
-from protocols.pilt_protocol import PILTProtocol, PILTConfig, GAConfig
-from protocols.ltp_protocol  import LTPProtocol
-from protocols.plot_protocol import PLOTProtocol
-# main.py wires the four protocols into a single BSP loop;
-# select with --protocols.
-```
-
-### C++ (embeddable)
-
-```cpp
-#include "pilt/encoder.hpp"      // pilt::PILTEncoder / PILTAggregator
-#include "dctcp/protocol.hpp"    // dctcp::Encoder / Aggregator
-#include "ltp/protocol.hpp"      // ltp::Encoder / Aggregator + decide_close()
-#include "plot/protocol.hpp"     // plot::Encoder / Aggregator (two-pass)
-#include "common/tcp.hpp"        // POSIX TCP helpers + try_set_dctcp(fd)
-```
-
-See `cpp_proto/README.md` for the full API.
+demand by the runners and are intentionally not part of the source
+tree.
 
 ---
 
