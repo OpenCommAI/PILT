@@ -52,6 +52,7 @@ from protocols.pilt_protocol import (
 )
 from protocols.ltp_protocol import LTPProtocol
 from protocols.plot_protocol import PLOTProtocol
+from protocols.autotuner import OverlapAutoTuner, AutoTuneConfig
 
 import ns3ai_fl_py as fl_binding
 from ns3ai_utils import Experiment
@@ -226,6 +227,9 @@ def run_simulation(protocol_name   : str,
                    pilt_n_rbs      : int = 10,
                    pilt_rb_bw_khz  : float = 900.0,
                    pilt_pipeline_ga: bool = True,
+                   autotune        : bool = False,
+                   autotune_target : float = 0.9,
+                   autotune_max_E  : int = 16,
                    verbose_every   : int = 5,
                    checkpoint_path : str | None = None,
                    checkpoint_every: int = 50,
@@ -368,6 +372,27 @@ def run_simulation(protocol_name   : str,
           f"uplink={per_worker_uplink_mbps:.0f}Mbps "
           f"time_limit={time_limit_ms/1000:.0f}s")
     print(f"{'=' * 72}")
+
+    # ── Built-in adjudicator (内置判决模块, opt-in) ─────────────────────────
+    # When --autotune is on AND we are running PILT, run a short startup
+    # micro-benchmark that times the actual SGD pass and a grid of GA
+    # solver configurations on the live scheduling instance, and tunes
+    # local_steps + (Np, G_max) so the GA scheduler's wall-time hides
+    # inside worker SGD (overlap target).  Other protocols are not GA-
+    # dependent and skip calibration.
+    if autotune and protocol_name == "pilt" and pilt_obj is not None:
+        autotune_report = OverlapAutoTuner(AutoTuneConfig(
+            enabled         = True,
+            target_overlap  = float(autotune_target),
+            max_local_steps = int(autotune_max_E),
+        )).calibrate(
+            pilt_obj  = pilt_obj,
+            workers   = workers,
+            ps        = ps,
+            model_cfg = cfg.MODEL,
+            sim_cfg   = cfg.SIMULATION,
+        )
+        print(autotune_report, flush=True)
 
     start_wall = time.time()
     r = 0
@@ -862,6 +887,23 @@ def main():
                          "M·W = 9 MHz total).")
     ap.add_argument("--pilt_no_pipeline_ga", action="store_true",
                     help="Disable GA / worker-SGD pipelining (ablation).")
+
+    # ── Built-in adjudicator (内置判决模块) — optional ───────────────────────
+    ap.add_argument("--autotune", action="store_true",
+                    help="Enable the built-in adjudicator: at startup the "
+                         "module micro-benchmarks T_cmp and T_GA on the live "
+                         "instance and tunes local_steps + GA Np/G_max so "
+                         "the GA scheduler's wall-time is hidden inside "
+                         "worker SGD when --pilt_pipeline_ga is on.  Off by "
+                         "default — users opt in.")
+    ap.add_argument("--autotune_target", type=float, default=0.9,
+                    help="(autotune) target ratio T_GA / T_cmp ∈ (0,1]. "
+                         "Smaller values leave more safety bubble for "
+                         "runtime jitter.  Default 0.9.")
+    ap.add_argument("--autotune_max_E", type=int, default=16,
+                    help="(autotune) cap on local_steps when the calibrator "
+                         "needs to bump E to extend the compute mask. "
+                         "Default 16.")
     args = ap.parse_args()
 
     # Optional model override propagates into the shared config used below
@@ -949,6 +991,9 @@ def main():
                 pilt_n_rbs    = args.pilt_n_rbs,
                 pilt_rb_bw_khz= args.pilt_rb_bw_khz,
                 pilt_pipeline_ga = not args.pilt_no_pipeline_ga,
+                autotune        = args.autotune,
+                autotune_target = args.autotune_target,
+                autotune_max_E  = args.autotune_max_E,
                 checkpoint_path = ckpt_path,
                 checkpoint_every = 50,
             )

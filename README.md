@@ -119,7 +119,32 @@ Outputs are saved to `results/metrics_<protocol>.npz`:
 | `--rounds` | 100000 | hard cap on rounds (whichever hits first) |
 | `--pilt_n_rbs` | 10 | M, time-frequency RB grid size |
 | `--pilt_pipeline_ga` | 1 | overlap GA with worker SGD |
+| `--autotune` | off | enable the built-in adjudicator (see below) |
+| `--autotune_target` | 0.9 | target ratio `T_GA / T_cmp ∈ (0,1]` for the adjudicator |
+| `--autotune_max_E` | 16 | cap on `local_steps` the adjudicator may pick |
 | `--seed` | 0 | global RNG seed |
+
+### Built-in adjudicator (内置判决模块, opt-in)
+
+When `--autotune` is set AND the protocol is `pilt`, the driver runs a
+short startup micro-benchmark before the BSP loop:
+
+1. Times one real `worker.compute_gradient(...)` pass on the slowest
+   (largest-shard) worker — this is `T_cmp`.
+2. Times the dual-population GA solver on the live scheduling instance
+   for a small grid of `(Np, G_max)` candidates — this is `T_GA(Np,G_max)`.
+3. Picks the largest `(Np, G_max)` such that
+   `T_GA · safety_margin ≤ target_overlap · T_cmp`. If no candidate fits
+   even at the smallest grid point, the calibrator bumps `local_steps`
+   (capped at `--autotune_max_E`) to extend the compute mask, and
+   rescales the simulator's `worker_compute_ms` accordingly so the BSP
+   accounting stays consistent.
+
+Effect: when GA / SGD pipelining is on (default), `ps_exposed_ms → 0`
+and the GA's intrinsic wall-time is hidden inside worker compute — the
+algorithm overhead never surfaces on the round critical path.  Off by
+default — users opt in.  Implementation: `protocols/autotuner.py`
+(`OverlapAutoTuner`, `AutoTuneConfig`, `AutoTuneReport`).
 
 ---
 
@@ -178,7 +203,9 @@ FL/
 ├── protocols/                # algorithm-side implementations
 │   ├── pilt_protocol.py      #   PILT: importance EMA + ranked ε_l + top-|g| + EF + GA
 │   ├── ltp_protocol.py       #   baseline: Early-Close + Random-K bubble-fill
-│   └── plot_protocol.py      #   baseline: per-layer LTT + retx
+│   ├── plot_protocol.py      #   baseline: per-layer LTT + retx
+│   └── autotuner.py          #   opt-in adjudicator: probes T_cmp / T_GA at startup,
+│                             #   tunes local_steps + GA Np/G_max for overlap hiding
 │   # DCTCP baseline is inlined in main.py (reliable full-grad)
 │
 ├── federated/                # PyTorch FL building blocks
