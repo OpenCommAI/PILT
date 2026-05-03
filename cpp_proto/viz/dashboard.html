@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>4-protocol comparison — interactive dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --ink: #e6edf3;
+    --muted: #8b949e; --accent: #58a6ff; --good: #3fb950;
+  }
+  body {
+    margin: 0; padding: 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg); color: var(--ink);
+  }
+  h1 { margin: 0 0 4px; font-weight: 700; font-size: 22px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 14px; }
+  .grid {
+    display: grid; gap: 18px;
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  }
+  .panel {
+    background: var(--panel); border: 1px solid #30363d;
+    border-radius: 10px; padding: 14px 18px;
+  }
+  .panel h2 {
+    margin: 0 0 10px; font-size: 15px; font-weight: 600;
+    color: var(--accent); letter-spacing: 0.3px;
+  }
+  .panel .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .summary { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 18px; }
+  .kpi {
+    background: var(--panel); border: 1px solid #30363d;
+    border-radius: 10px; padding: 12px 18px; min-width: 140px;
+  }
+  .kpi .label { color: var(--muted); font-size: 12px; }
+  .kpi .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .kpi .delta { color: var(--good); font-size: 12px; margin-top: 2px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid #30363d; padding: 6px 10px;
+           text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  td.dim { color: var(--muted); }
+  .controls { margin-bottom: 14px; display: flex; gap: 12px; align-items: center; }
+  select, input[type="file"] {
+    background: var(--panel); color: var(--ink); border: 1px solid #30363d;
+    border-radius: 6px; padding: 6px 10px;
+  }
+  .err {
+    background: #5a1818; padding: 12px; border-radius: 8px; color: #ffd0d0;
+    font-family: monospace; font-size: 13px; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+
+<h1>NS3-AI Simulation + C++ Protocol Library · Dashboard</h1>
+<div class="subtitle" id="subtitle">loading dashboard_data.json …</div>
+
+<div class="controls">
+  <label>data source:&nbsp;</label>
+  <select id="source">
+    <option value="dashboard_data.json">dashboard_data.json (default)</option>
+  </select>
+  <input type="file" id="file_input" accept=".json">
+  <span class="hint">If opening via file:// the browser cannot fetch — use the upload button to load a local JSON.</span>
+</div>
+
+<div class="summary" id="kpi_row"></div>
+
+<div class="grid">
+  <div class="panel"><h2>① Accuracy vs simulated time</h2>
+    <div id="acc_curve" style="height: 360px"></div>
+    <div class="hint">x = simulated wall-clock seconds (includes GA overhead); y = test_acc. Steeper / further-left curves are better.</div>
+  </div>
+  <div class="panel"><h2>② Test-loss curves</h2>
+    <div id="loss_curve" style="height: 360px"></div>
+    <div class="hint">A flat or rising loss means the protocol is not converging under the channel.</div>
+  </div>
+  <div class="panel"><h2>③ Same-sim-time comparison table</h2>
+    <div id="compare_table" style="overflow:auto; max-height: 360px"></div>
+  </div>
+  <div class="panel"><h2>④ Time-to-target (simulated seconds)</h2>
+    <div id="ttt_chart" style="height: 360px"></div>
+    <div class="hint">Earliest sim-time at which a target accuracy is reached. Lower is better.</div>
+  </div>
+  <div class="panel"><h2>⑤ C++ head-to-head bench: bytes_sent</h2>
+    <div id="bench_bytes" style="height: 320px"></div>
+    <div class="hint">Single-machine round-trip on synthetic gradients; NS-3 not involved.</div>
+  </div>
+  <div class="panel"><h2>⑥ C++ delivery_correlation vs bytes_sent</h2>
+    <div id="bench_scatter" style="height: 320px"></div>
+    <div class="hint">Top-left is better (fewer bytes, higher correlation).</div>
+  </div>
+  <div class="panel"><h2>⑦ PILT GA overhead: intrinsic vs exposed</h2>
+    <div id="ga_curve" style="height: 320px"></div>
+    <div class="hint">GA(intrinsic) = raw GA compute time; GA(exposed) = portion that actually surfaces into round_ms after pipelining with worker SGD.</div>
+  </div>
+  <div class="panel"><h2>⑧ Per-round wall time (BSP rounds)</h2>
+    <div id="round_ms_curve" style="height: 320px"></div>
+    <div class="hint">Each curve = round_ms vs round index.</div>
+  </div>
+</div>
+
+<script>
+const COLOR = { DCTCP:"#d62728", LTP:"#ff7f0e", PLOT:"#9467bd", PILT:"#1f77b4" };
+
+function fmt(x, d=3) { return x == null ? "—" : x.toFixed(d); }
+
+function fail(msg) {
+  document.body.innerHTML = `<div class='err'>${msg}</div>`;
+}
+
+async function loadDefault() {
+  try {
+    const r = await fetch("dashboard_data.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+document.getElementById("file_input").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const txt = await f.text();
+  try { render(JSON.parse(txt)); }
+  catch (err) { fail("Bad JSON: " + err.message); }
+});
+
+function emptyPlot(divId, msg) {
+  Plotly.newPlot(divId, [{x:[0,1], y:[0,1], mode:"text", text:[msg,""],
+                          textfont:{color:"#888", size:14}}], {
+    paper_bgcolor:"transparent", plot_bgcolor:"transparent",
+    xaxis:{visible:false}, yaxis:{visible:false}, showlegend:false,
+    margin:{l:10,r:10,t:10,b:10}
+  }, {displayModeBar:false});
+}
+
+function plotCurves(divId, sim, ykey, ytitle, ylog=false) {
+  if (!sim || !sim.length) return emptyPlot(divId, "(no sim data)");
+  const traces = sim.map(p => ({
+    x: p.sim_seconds, y: p[ykey],
+    name: p.name, mode: "lines",
+    line: { color: COLOR[p.name] || "#aaa", width: 2 }
+  }));
+  Plotly.newPlot(divId, traces, {
+    paper_bgcolor:"transparent", plot_bgcolor:"transparent",
+    font: { color: "#e6edf3" },
+    margin:{l:55,r:20,t:10,b:50},
+    xaxis:{title:"sim seconds", gridcolor:"#30363d", zerolinecolor:"#30363d"},
+    yaxis:{title:ytitle, type: ylog?"log":"linear",
+           gridcolor:"#30363d", zerolinecolor:"#30363d"},
+    legend:{orientation:"h", y:-0.20}
+  }, {responsive:true, displaylogo:false});
+}
+
+function plotRoundsCurves(divId, sim) {
+  if (!sim || !sim.length) return emptyPlot(divId, "(no sim data)");
+  const traces = sim.map(p => ({
+    x: p.rounds, y: p.round_ms, name: p.name, mode: "lines",
+    line: { color: COLOR[p.name] || "#aaa", width: 2 }
+  }));
+  Plotly.newPlot(divId, traces, {
+    paper_bgcolor:"transparent", plot_bgcolor:"transparent",
+    font: { color: "#e6edf3" },
+    margin:{l:60,r:20,t:10,b:50},
+    xaxis:{title:"BSP round", gridcolor:"#30363d"},
+    yaxis:{title:"round_ms (sim)", gridcolor:"#30363d"},
+    legend:{orientation:"h", y:-0.20}
+  }, {responsive:true, displaylogo:false});
+}
+
+function plotGAOverhead(divId, sim) {
+  const pilt = sim ? sim.find(s => s.name === "PILT") : null;
+  if (!pilt || !pilt.ps_overhead_ms.length) {
+    return emptyPlot(divId, "(no PILT GA data)");
+  }
+  Plotly.newPlot(divId, [
+    { x: pilt.rounds, y: pilt.ps_overhead_ms, name:"GA intrinsic",
+      mode:"lines", line:{color:"#58a6ff", width:2} },
+    { x: pilt.rounds, y: pilt.ps_exposed_ms, name:"GA exposed (after pipelining)",
+      mode:"lines", line:{color:"#3fb950", width:2} }
+  ], {
+    paper_bgcolor:"transparent", plot_bgcolor:"transparent",
+    font: { color: "#e6edf3" },
+    margin:{l:60,r:20,t:10,b:50},
+    xaxis:{title:"BSP round", gridcolor:"#30363d"},
+    yaxis:{title:"ms", gridcolor:"#30363d"},
+    legend:{orientation:"h", y:-0.20}
+  }, {responsive:true, displaylogo:false});
+}
+
+function plotBenchBytes(divId, bench) {
+  if (!bench || !bench.protocols) return emptyPlot(divId, "(no bench data — run cpp_proto/build/compare_protocols)");
+  const names = bench.protocols.map(p => p.name);
+  const bytes = bench.protocols.map(p => p.bytes_sent / 1e6);
+  Plotly.newPlot(divId, [{
+    type:"bar", x: names, y: bytes,
+    marker: { color: names.map(n => COLOR[n] || "#888") },
+    text: bytes.map(v => v.toFixed(2) + " MB"), textposition:"outside"
+  }], {
+    paper_bgcolor:"transparent", plot_bgcolor:"transparent",
+    font: { color:"#e6edf3" },
+    margin:{l:50,r:20,t:10,b:40},
+    yaxis:{title:"bytes_sent (MB)", gridcolor:"#30363d"},
+    xaxis:{gridcolor:"#30363d"}
+  }, {responsive:true, displaylogo:false});
+}
+
+function plotBenchScatter(divId, bench) {
+  if (!bench || !bench.protocols) return emptyPlot(divId, "(no bench data)");
+  const traces = bench.protocols.map(p => ({
+    x: [p.bytes_sent / 1e6], y: [p.delivery_correlation],
+    name: p.name, mode: "markers+text",
+    marker: { color: COLOR[p.name] || "#aaa", size: 18, line: {color:"#fff", width:1} },
+    text: [p.name], textposition:"top center"
+  }));
+  Plotly.newPlot(divId, traces, {
+    paper_bgcolor:"transparent", plot_bgcolor:"transparent",
+    font: { color:"#e6edf3" },
+    margin:{l:55,r:20,t:10,b:50},
+    xaxis:{title:"bytes_sent (MB)", type:"log", gridcolor:"#30363d"},
+    yaxis:{title:"delivery_correlation", gridcolor:"#30363d", range:[0,1.05]},
+    showlegend:false
+  }, {responsive:true, displaylogo:false});
+}
+
+function plotTTT(divId, ttt) {
+  if (!ttt || !ttt.target_acc || !ttt.target_acc.length) {
+    return emptyPlot(divId, "(no time-to-target data)");
+  }
+  const protos = Object.keys(ttt).filter(k => k !== "target_acc");
+  const traces = protos.map(p => ({
+    type: "bar", name: p,
+    x: ttt.target_acc.map(t => "acc=" + t.toFixed(2)),
+    y: ttt[p],
+    marker: { color: COLOR[p] || "#888" }
+  }));
+  Plotly.newPlot(divId, traces, {
+    paper_bgcolor:"transparent", plot_bgcolor:"transparent",
+    font: { color:"#e6edf3" }, barmode:"group",
+    margin:{l:55,r:20,t:10,b:60},
+    yaxis:{title:"sim seconds to reach target", gridcolor:"#30363d"},
+    xaxis:{gridcolor:"#30363d"},
+    legend:{orientation:"h", y:-0.30}
+  }, {responsive:true, displaylogo:false});
+}
+
+function renderTable(divId, ct) {
+  if (!ct || !ct.sim_seconds || !ct.sim_seconds.length) {
+    document.getElementById(divId).innerHTML = "<div class='hint'>(no comparison data)</div>";
+    return;
+  }
+  const protos = Object.keys(ct).filter(k => k.endsWith("_acc")).map(k => k.slice(0, -4));
+  let html = "<table><thead><tr><th>sim s</th>";
+  for (const p of protos) html += `<th>${p}<br><span class='hint'>acc</span></th>`;
+  for (const p of protos) html += `<th>${p}<br><span class='hint'>loss</span></th>`;
+  html += "</tr></thead><tbody>";
+  for (let i = 0; i < ct.sim_seconds.length; ++i) {
+    html += `<tr><td>${ct.sim_seconds[i].toFixed(0)}</td>`;
+    for (const p of protos) html += `<td>${fmt(ct[p+"_acc"][i],3)}</td>`;
+    for (const p of protos) html += `<td class="dim">${fmt(ct[p+"_loss"][i],3)}</td>`;
+    html += "</tr>";
+  }
+  html += "</tbody></table>";
+  document.getElementById(divId).innerHTML = html;
+}
+
+function renderKPIs(divId, sim) {
+  const cont = document.getElementById(divId);
+  cont.innerHTML = "";
+  if (!sim || !sim.length) return;
+  const pilt = sim.find(s => s.name === "PILT");
+  const ltp  = sim.find(s => s.name === "LTP");
+  const dctcp= sim.find(s => s.name === "DCTCP");
+
+  const card = (label, val, delta) => `
+    <div class="kpi"><div class="label">${label}</div>
+      <div class="value">${val}</div>
+      ${delta ? `<div class="delta">${delta}</div>` : ""}</div>`;
+
+  let html = "";
+  for (const p of sim) {
+    html += card(p.name + " final acc", p.final_acc.toFixed(3),
+                 `loss ${p.final_loss.toFixed(3)}, ${p.total_rounds} rounds`);
+  }
+  if (pilt && ltp) {
+    const speedup = (() => {
+      // sim time at which PILT first hits LTP's final acc
+      const target = ltp.final_acc;
+      for (let i = 0; i < pilt.test_acc.length; ++i) {
+        if (pilt.test_acc[i] >= target) {
+          return ltp.max_sim_seconds / pilt.sim_seconds[i];
+        }
+      }
+      return null;
+    })();
+    if (speedup) {
+      html += card("PILT vs LTP time-to-target",
+                   speedup.toFixed(2) + "×",
+                   "factor of sim-time saved to reach LTP's final accuracy");
+    }
+  }
+  cont.innerHTML = html;
+}
+
+function render(payload) {
+  document.getElementById("subtitle").textContent =
+    `schema=${payload.schema}; ${payload.sim ? payload.sim.length : 0} sim curve(s); ` +
+    `${payload.bench ? payload.bench.protocols.length + ' bench item(s)' : 'no bench'}`;
+
+  renderKPIs("kpi_row", payload.sim);
+  plotCurves("acc_curve",  payload.sim, "test_acc",  "test_acc");
+  plotCurves("loss_curve", payload.sim, "test_loss", "test_loss");
+  renderTable("compare_table", payload.compare_table);
+  plotTTT("ttt_chart", payload.time_to_target);
+  plotBenchBytes("bench_bytes", payload.bench);
+  plotBenchScatter("bench_scatter", payload.bench);
+  plotGAOverhead("ga_curve", payload.sim);
+  plotRoundsCurves("round_ms_curve", payload.sim);
+}
+
+(async () => {
+  const data = await loadDefault();
+  if (!data) {
+    document.getElementById("subtitle").innerHTML =
+      "<span class='hint'>dashboard_data.json not loaded. Use the upload button to pick a local JSON, " +
+      "or run <code>python3 -m http.server</code> from <code>cpp_proto/</code>.</span>";
+    render({});                        // render empty state
+    return;
+  }
+  render(data);
+})();
+</script>
+</body>
+</html>

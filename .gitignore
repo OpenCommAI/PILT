@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+
+# C++ build
+cpp_proto/build/
+*.o
+*.a
+*.so
+*.dylib
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Simulation outputs / runtime artefacts
+results/
+logs/
+data/
+cpp_proto/viz/dashboard_data.json
+cpp_proto/viz/proto_bench.json
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Misc
+*.log
+*.tmp
